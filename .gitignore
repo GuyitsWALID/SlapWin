@@ -1,0 +1,33 @@
+## Build System
+/build
+/target/
+node_modules/
+
+## IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+## OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+## Runtime
+*.log
+*.dat
+config/
+
+## Secrets
+.env
+.env.local
+.env.production
+*.pem
+*.key
+*.pfx
+
+## Test
+coverage/
+*.lcov

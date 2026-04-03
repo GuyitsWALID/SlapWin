@@ -1,0 +1,13 @@
+{
+  "name": "slapmac",
+  "version": "0.1.0",
+  "description": "Your Mac deserves better. Make it slap.",
+  "scripts": {
+    "tauri": "tauri",
+    "dev": "tauri dev",
+    "build": "tauri build"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2.0.0 || ^3.0.0"
+  }
+}
