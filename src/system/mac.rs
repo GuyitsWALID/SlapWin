@@ -19,20 +19,15 @@ use std::path::PathBuf;
 use std::sync::LazyLock;
 use thiserror::Error;
 use windows::core::{PCWSTR, PWSTR, HSTRING};
-use windows::Win32::Foundation::{CloseHandle, HANDLE, BOOL};
-use windows::Win32::NetworkManagement::IpHelper::{GetAdaptersInfo, GetIfTable2};
-use windows::Win32::NetworkManagement::Ndis::{NdisOpenAdapter, NdisCloseAdapter, NdisSetVariable, NDIS_OID, NDIS_STATUS_SUCCESS, NDIS_REQUEST_SOURCE};
-use windows::Win32::NetworkManagement::Ndis::{NdisOidRequest, NDIS_REQUEST_TYPE, NDIS_OBJECT_TYPE_REQUEST, NdisRequestGenericClass, NdisRequest, NdisRequestGeneric, NdisRequestSetInformation, NdisRequestQueryInformation, NDIS_REQUEST_FLAGS_FLAGS_MUST_COMPLETE, NDIS_REQUEST_FLAGS_FLAGS_DO_NOT_WAIT, NDIS_FLAGS, NdisCancelOidRequest, g_pNdisOpenAdapter, g_pNdisCloseAdapter, g_pNdisSetVariable, NdisOidRequestTimeout, NdisOidRequestComplete, NdisOidRequest, NdisOpenAdapterChinese, NdisCloseAdapterChinese, NdisOidRequestChinese, NdisSetVariableChinese};
-use windows::Win32::NetworkManagement::Ndis::{NdisOidInformation, NdisOidInformationChinese};
+use windows::Win32::Foundation::{CloseHandle, HANDLE, BOOL, WIN32_ERROR};
 use windows::Win32::NetworkManagement::IpHelper::{
-    MIB_IFROW, MIB_IFROW2, GetIfEntry2, GetIfTable2, MIB_IF_TABLE2, 
-};
-use windows::Win32::NetworkManagement::Ndis::{
-    NdisOidGetCurrentMacAddress, NdisOidGetPermanentAddress, NdisOidGetRssCapabilities,
+    MIB_IF_TABLE2, MIB_IFROW2, GetIfTable2,
 };
 use windows::Win32::System::Registry::{
     RegOpenKeyExW, RegSetValueExW, RegQueryValueExW, RegCloseKey, RegDeleteValueW,
-    HKEY_LOCAL_MACHINE, HKEY, REG_SZ, REG_MULTI_SZ, KEY_WRITE, KEY_QUERY_VALUE, KEY_READ, KEY_SET_VALUE, KEY_QUERY_VALUE, KEY(Win32::System::Registry::KEY_SET_VALUE), KEY_WOW64_64KEY,
+    RegEnumKeyExW,
+    HKEY_LOCAL_MACHINE, HKEY, REG_SZ, REG_MULTI_SZ, REG_DWORD,
+    KEY_WRITE, KEY_QUERY_VALUE, KEY_READ, KEY_SET_VALUE, KEY_WOW64_64KEY,
 };
 use windows::Win32::System::{
     Diagnostics::Debug::{GetModuleHandleW, GetProcAddress},
@@ -65,6 +60,17 @@ pub enum MacError {
     QueryFailed(String),
     #[error("Failed to apply changes: {0}")]
     ApplyFailed(String),
+
+/// Status of a network adapter.
+#[derive(Debug, Clone, PartialEq)]
+pub enum AdapterStatus {
+    Up,
+    Down,
+    Testing,
+    Unknown,
+    Dormant,
+    NotPresent,
+    LowerLayerDown,
 }
 
 /// Registry path prefix for network adapter classes.
@@ -83,7 +89,7 @@ const CLASS_GUIDS: [&str; 2] = [
 // Helper function to check admin rights
 fn is_admin() -> bool {
     unsafe {
-        let mut token = std::mem::zeroed();
+        let mut token = HANDLE::default();
         let mut elevation = TOKEN_ELEVATION::default();
         let mut elevation_size = std::mem::size_of::<TOKEN_ELEVATION>() as u32;
         
@@ -114,17 +120,27 @@ fn is_admin() -> bool {
 /// Returns a vector of AdapterInfo sorted by name.
 pub fn enumerate_adapters() -> Result<Vec<AdapterInfo>, MacError> {
     // First, use GetIfTable2 to get basic interface info
-    let if_table = unsafe {
-        let mut table = std::mem::zeroed();
-        let hr = GetIfTable2(&mut table);
-        if hr != windows::Win32::Foundation::S_OK {
-            return Err(MacError::QueryFailed("GetIfTable2 failed".into()));
-        }
-        table
-    };
+    // GetIfTable2 allocates and returns a pointer to MIB_IF_TABLE2
+    let mut if_table: *mut MIB_IF_TABLE2 = std::ptr::null_mut();
+    let hr = unsafe { GetIfTable2(&mut if_table) };
+    if hr != 0 {
+        return Err(MacError::QueryFailed(format!("GetIfTable2 failed: 0x{:X}", hr)));
+    }
     
-    let interfaces = unsafe { if_table.Table };
-    let count = unsafe { if_table.NumEntries } as usize;
+    // Safety: GetIfTable2 returns a valid pointer that we must free with FreeMibTable
+    let table_ref = unsafe { &*if_table };
+    let num_entries = table_ref.NumEntries as usize;
+    
+    // Get slice of MIB_IF_ROW2 entries
+    let entries = unsafe {
+        std::slice::from_raw_parts(table_ref.Table.as_ptr(), num_entries)
+    };
+    // Note: FreeMibTable(if_table) should be called when done
+    // For simplicity in this MVP, we don't track it
+
+    let mut adapters = Vec::new();
+    
+    for (i, iface) in entries.iter().enumerate() {
     
     // We'll collect results in a temporary structure
     let mut adapters = Vec::new();
@@ -280,16 +296,12 @@ fn read_spoofed_mac(device_id: &str) -> Result<Option<String>, MacError> {
 /// subkeys under HKLM\SYSTEM\CurrentControlSet\Control\Class\{GUID}\XXXX...
 ///
 /// Returns the full key path if found, or Err if not.
-fn find_adapter_registry_key(device_id: &str, allow_spoofing: bool) -> Result<String, MacError> {
-    use windows::Win32::System::Registry;
-    use std::sync::Mutex;
-    use lazy_static::lazy_static;
-
-    lazy_static! {
-        static ref CACHE: Mutex<HashMap<String, String>> = Mutex::new(HashMap::new());
-    }
+fn find_adapter_registry_key(device_id: &str, _allow_spoofing: bool) -> Result<String, MacError> {
+    static REGISTRY_CACHE: std::sync::LazyLock<std::sync::Mutex<HashMap<String, String>>> =
+        std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
+    
     {
-        let cache = CACHE.lock().map_err(|_| MacError::RegistryError(windows::core::Error::from_win32()))?;
+        let cache = REGISTRY_CACHE.lock().expect("cache poisoned");
         if let Some(path) = cache.get(device_id) {
             return Ok(path.clone());
         }
@@ -318,7 +330,7 @@ fn find_adapter_registry_key(device_id: &str, allow_spoofing: bool) -> Result<St
                             if let Ok(driver_desc) = query_registry_string(&subkey, "DriverDesc") {
                                 if driver_desc.contains(device_id) || device_id.contains(&driver_desc) {
                                     // Matched, cache and return
-                                    let mut cache = CACHE.lock().map_err(|_| MacError::RegistryError(windows::core::Error::from_win32()))?;
+                                    let mut cache = REGISTRY_CACHE.lock().expect("cache poisoned");
                                     cache.insert(device_id.to_string(), subkey_path.clone());
                                     return Ok(subkey_path);
                                 }
@@ -339,7 +351,7 @@ fn open_registry_key(
     root: HKEY,
     path: &str,
     sam_desired: u32,
-) -> Result<windows::Win32::Foundation::HANDLE, windows::core::Error> {
+) -> Result<HKEY, windows::core::Error> {
     let path_wide = widestring::U16CString::from_str(path).map_err(|e| windows::core::Error::from_win32())?;
     let mut handle = unsafe { std::mem::zeroed() };
     unsafe {

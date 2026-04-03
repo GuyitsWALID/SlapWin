@@ -3,7 +3,7 @@ use chrono::{DateTime, NaiveDate, NaiveDateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -60,7 +60,7 @@ impl LicenseManager {
     pub fn load(path: &Path) -> Result<Self> {
         let storage = PersistentStorage::load(path).context("load persistent storage")?;
         // In a real app, this would be a proper secret stored securely
-        let secret = std::env::var("SLAPMAC_LICENSE_SECRET")
+        let secret = std::env::var("SIGNING_SECRET")
             .unwrap_or_else(|_| "dev-secret-12345".to_string());
         Ok(Self {
             storage,
